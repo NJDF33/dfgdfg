@@ -4,6 +4,9 @@ import uuid
 import json
 import threading
 import time
+import asyncio
+import aiohttp
+import aiofiles
 from pathlib import Path
 import requests
 from telegram import Update, Bot, InputFile
@@ -54,6 +57,10 @@ class LinkCheckerJob(threading.Thread):
             self.bot.send_message(self.chat_id, f"Job {self.job_id} failed: {e}")
 
     def _run(self):
+        # Run the async event loop for high-concurrency checks
+        asyncio.run(self._run_async())
+
+    async def _run_async(self):
         lines = self.input_path.read_text(encoding='utf-8', errors='ignore').splitlines()
         entries = []  # tuples (original_line, extracted_url)
         for ln in lines:
@@ -82,64 +89,102 @@ class LinkCheckerJob(threading.Thread):
             self.bot.send_message(self.chat_id, f"Job {self.job_id}: no URLs found in file.")
             return
 
-        msg = self.bot.send_message(self.chat_id, f"Job {self.job_id} started: 0/{total} (0%)")
-        results = []
-        processed = 0
+        # create output file and state
+        out_path = self.job_path / "alive.txt"
+        out_path.write_text('', encoding='utf-8')
 
         # Load checkpoint if exists
+        processed = 0
         if self.state_file.exists():
             state = json.loads(self.state_file.read_text())
             processed = state.get('processed', 0)
-            results = state.get('results', [])
 
-        for idx in range(processed, total):
-            # check for external stop flag
-            if (self.job_path / 'STOP').exists():
-                self._save_state(idx, results)
-                self.bot.send_message(self.chat_id, f"Job {self.job_id} stopped at {idx}/{total}.")
-                self._send_partial_results(results)
-                return
+        # prepare websocket-like progress message
+        msg = self.bot.send_message(self.chat_id, f"Job {self.job_id} started: {processed}/{total} (0%)")
 
-            key = order[idx]
-            url = mapping[key]['url']
-            ok = self._check_url(url)
-            if ok:
-                # include all original lines for this url
-                for l in mapping[key]['lines']:
-                    results.append(l)
+        # concurrency config (env or default)
+        try:
+            concurrency = int(os.environ.get('LINK_CHECKER_CONCURRENCY', '200'))
+        except Exception:
+            concurrency = 200
 
-            processed = idx + 1
-            pct = int(processed * 100 / total)
-            try:
-                self.bot.edit_message_text(chat_id=self.chat_id, message_id=msg.message_id,
-                                           text=f"Job {self.job_id} progress: {processed}/{total} ({pct}%)")
-            except Exception:
-                # ignore edit failures
-                pass
-            # checkpoint after each item
-            self._save_state(processed, results)
+        sem = asyncio.Semaphore(concurrency)
+        session_timeout = aiohttp.ClientTimeout(total=20)
 
-        # finished
-        out_path = self.job_path / "alive.txt"
-        out_path.write_text('\n'.join(results), encoding='utf-8')
+        processed_counter = processed
+        last_update = time.time()
+        update_interval = float(os.environ.get('PROGRESS_UPDATE_INTERVAL', '2.0'))
+        checkpoint_interval = int(os.environ.get('CHECKPOINT_INTERVAL', '100'))
+
+        async with aiohttp.ClientSession(timeout=session_timeout) as session:
+            async def worker(key, url, lines_for_url):
+                nonlocal processed_counter, last_update
+                async with sem:
+                    # early stop check
+                    if (self.job_path / 'STOP').exists():
+                        return
+                    ok = await self._check_url_async(session, url)
+                    if ok:
+                        # append original lines to output file incrementally
+                        async with aiofiles.open(out_path, 'a', encoding='utf-8') as af:
+                            for l in lines_for_url:
+                                await af.write(l.rstrip('\n') + '\n')
+
+                    processed_counter += 1
+                    now = time.time()
+                    if (now - last_update) >= update_interval or (processed_counter % checkpoint_interval) == 0:
+                        pct = int(processed_counter * 100 / total)
+                        try:
+                            self.bot.edit_message_text(chat_id=self.chat_id, message_id=msg.message_id,
+                                                       text=f"Job {self.job_id} progress: {processed_counter}/{total} ({pct}%)")
+                        except Exception:
+                            pass
+                        # save checkpoint periodically
+                        self._save_state(processed_counter, [])
+                        last_update = now
+
+            tasks = []
+            for idx in range(processed, total):
+                key = order[idx]
+                url = mapping[key]['url']
+                lines_for_url = mapping[key]['lines']
+                # stop if requested
+                if (self.job_path / 'STOP').exists():
+                    break
+                tasks.append(asyncio.create_task(worker(key, url, lines_for_url)))
+
+            # run tasks in batches to avoid scheduling 1M tasks at once
+            BATCH = int(os.environ.get('TASK_BATCH_SIZE', '10000'))
+            for i in range(0, len(tasks), BATCH):
+                batch = tasks[i:i+BATCH]
+                await asyncio.gather(*batch)
+
+        # final state
+        # read out count of lines in out_path
+        count = 0
+        if out_path.exists():
+            count = sum(1 for _ in out_path.read_text(encoding='utf-8').splitlines() if _.strip())
+
         self.bot.send_document(self.chat_id, document=InputFile(str(out_path)), filename=f"alive_{self.job_id}.txt")
-        self.bot.send_message(self.chat_id, f"Job {self.job_id} completed: {len(results)} alive links.")
+        self.bot.send_message(self.chat_id, f"Job {self.job_id} completed: {count} alive links.")
 
     def _check_url(self, url: str) -> bool:
+        # legacy synchronous wrapper kept for compatibility
+        return False
+
+    async def _check_url_async(self, session: aiohttp.ClientSession, url: str) -> bool:
         req_url = normalize_for_request(url)
         try:
-            # try as-is (https), then http fallback
-            r = requests.get(req_url, timeout=15, allow_redirects=True, verify=self.verify_tls)
-            if r.status_code < 400:
-                return True
+            async with session.get(req_url, allow_redirects=True, ssl=self.verify_tls) as resp:
+                if resp.status < 400:
+                    return True
         except Exception:
-            # try http if we tried https
             if req_url.startswith('https://'):
                 try:
-                    r = requests.get('http://' + req_url[len('https://'):], timeout=15, allow_redirects=True,
-                                     verify=self.verify_tls)
-                    if r.status_code < 400:
-                        return True
+                    alt = 'http://' + req_url[len('https://'):]
+                    async with session.get(alt, allow_redirects=True, ssl=self.verify_tls) as resp2:
+                        if resp2.status < 400:
+                            return True
                 except Exception:
                     return False
             return False
